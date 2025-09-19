@@ -1,7 +1,7 @@
 from datetime import datetime
 import datetime as dt
 
-from flask import Flask, jsonify, redirect, url_for, request
+from flask import Flask, jsonify, redirect, url_for, request, flash, render_template_string
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_cors import CORS
@@ -13,6 +13,12 @@ from wtforms import DateField
 
 # If you want simple HTTP Basic auth for /admin, uncomment these lines and the protected views below
 from flask_httpauth import HTTPBasicAuth
+# --- NEW: auth libs ---
+from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
+from werkzeug.security import generate_password_hash, check_password_hash
+from wtforms.fields.simple import PasswordField, BooleanField, StringField
+from wtforms.validators import DataRequired
+
 auth = HTTPBasicAuth()
 USERS = {"admin": "change-me"}  # Replace with something real or wire up Flask-Login/Flask-Security
 @auth.verify_password
@@ -31,6 +37,22 @@ CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
+
+
+class User(db.Model, UserMixin):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    is_admin = db.Column(db.Boolean, default=True, nullable=False)
+
+    def set_password(self, raw_password: str):
+        self.password_hash = generate_password_hash(raw_password)
+
+    def check_password(self, raw_password: str) -> bool:
+        return check_password_hash(self.password_hash, raw_password)
+
 
 # Association Table for Store-Category many-to-many relationship
 store_category = db.Table('store_category',
@@ -107,6 +129,77 @@ class Category(db.Model):
     def __repr__(self):
         return f'<Category {self.name}>'
 
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login"  # where to redirect when not authed
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Admin Login</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+</head>
+<body class="bg-light">
+<div class="container py-5">
+  <div class="row justify-content-center">
+    <div class="col-md-4">
+      <div class="card shadow-sm">
+        <div class="card-body">
+          <h4 class="mb-3">Sign in</h4>
+          {% with msgs = get_flashed_messages() %}
+            {% if msgs %}
+              <div class="alert alert-danger">{{ msgs[0] }}</div>
+            {% endif %}
+          {% endwith %}
+          <form method="post">
+            <div class="mb-3">
+              <label class="form-label">Username</label>
+              <input class="form-control" name="username" required autofocus>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Password</label>
+              <input class="form-control" type="password" name="password" required>
+            </div>
+            <button class="btn btn-primary w-100">Sign in</button>
+          </form>
+          <p class="text-muted mt-3 mb-0" style="font-size: .9rem;">
+            Tip: create your first user via CLI (see README in code comments).
+          </p>
+        </div>
+      </div>
+      <p class="text-center mt-3"><a href="{{ url_for('index_redirect') }}">&larr; Back</a></p>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        user = User.query.filter_by(username=username).first()
+        if user and user.check_password(password):
+            login_user(user)
+            next_url = request.args.get("next") or url_for("admin.index")
+            return redirect(next_url)
+        flash("Invalid username or password.")
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
 # -------------------- API ROUTES (unchanged) --------------------
 @app.route('/api/categories', methods=['GET'])
 def get_categories():
@@ -307,24 +400,19 @@ def get_total_coupons_count():
 # -------------------- ADMIN PANEL --------------------
 
 class SecureModelView(ModelView):
-    """Minimal hardening: search, filters, column order, and a place for auth.
-    Swap to Flask-Login/Flask-Security as needed.
-    """
-
-    # Uncomment for basic HTTP auth
-    # def is_accessible(self):
-    #     # With flask_httpauth you would wrap views instead; for Flask-Login, check current_user.is_authenticated
-    #     user = auth.current_user()
-    #     return user is not None
-
+    """Hardened base for admin views: login required + small quality-of-life tweaks."""
     can_view_details = True
     create_modal = True
     edit_modal = True
     column_display_all_relations = True
     page_size = 25
-
-    # Nice default formatters
     column_default_sort = ('id', False)
+
+    def is_accessible(self):
+        return current_user.is_authenticated and getattr(current_user, "is_admin", False)
+
+    def inaccessible_callback(self, name, **kwargs):
+        return redirect(url_for("login", next=request.url))
 
 
 class StoreAdmin(SecureModelView):
@@ -387,8 +475,37 @@ class CouponAdmin(SecureModelView):
             model.expiry_date = None
         return super().on_model_change(form, model, is_created)
 
+# --- NEW: Manage Users inside Admin ---
+class UserAdmin(SecureModelView):
+    column_list = ['id', 'username', 'is_admin']
+    column_searchable_list = ['id', 'username']
+    column_filters = ['is_admin']
+    form_excluded_columns = ['password_hash']
+    form_extra_fields = {
+        'username': StringField('Username', validators=[DataRequired()]),
+        'password': PasswordField('Password (leave blank to keep current)'),
+        'is_admin': BooleanField('Is Admin')
+    }
+
+    def on_model_change(self, form, model, is_created):
+        # Hash password if a new one was supplied
+        new_password = getattr(form, 'password').data if hasattr(form, 'password') else None
+        if is_created:
+            if not new_password:
+                raise ValueError("Password is required when creating a user.")
+            model.set_password(new_password)
+        else:
+            if new_password:  # only change if provided
+                model.set_password(new_password)
+        return super().on_model_change(form, model, is_created)
 
 class DashboardView(AdminIndexView):
+    def is_accessible(self):
+        return current_user.is_authenticated and getattr(current_user, "is_admin", False)
+
+    def inaccessible_callback(self, name, **kwargs):
+        return redirect(url_for("login", next=request.url))
+
     @expose('/')
     def index(self):
         store_count = Store.query.count()
@@ -400,16 +517,14 @@ class DashboardView(AdminIndexView):
                            coupon_count=coupon_count,
                            category_count=category_count)
 
-
 # Create admin and register views
 admin = Admin(app, name='Coupons Admin', template_mode='bootstrap4', index_view=DashboardView())
 admin.add_view(StoreAdmin(Store, db.session, category='Models'))
 admin.add_view(CouponAdmin(Coupon, db.session, category='Models'))
 admin.add_view(CategoryAdmin(Category, db.session, category='Models'))
-
+admin.add_view(UserAdmin(User, db.session, category='Security'))  # <- NEW
 
 # --- Minimal Jinja template for the admin dashboard quick stats ---
-# If you don't have a templates folder set up, this snippet uses Flask's in-memory loader pattern.
 from jinja2 import DictLoader, ChoiceLoader
 app.jinja_loader = ChoiceLoader([
     app.jinja_loader,
@@ -418,7 +533,15 @@ app.jinja_loader = ChoiceLoader([
         {% extends 'admin/master.html' %}
         {% block body %}
             <div class="container mt-4">
-                <h3>Coupons Admin – Overview</h3>
+                <div class="d-flex justify-content-between align-items-center">
+                    <h3>Coupons Admin – Overview</h3>
+                    <div>
+                        {% if current_user.is_authenticated %}
+                          <span class="me-3">Hello, {{ current_user.username }}</span>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('logout') }}">Logout</a>
+                        {% endif %}
+                    </div>
+                </div>
                 <div class="row mt-4">
                     <div class="col-md-4">
                         <div class="card">
@@ -453,13 +576,10 @@ app.jinja_loader = ChoiceLoader([
     })
 ])
 
-
 # Optional: convenience redirect from root to /admin
 @app.route('/')
 def index_redirect():
     return redirect(url_for('admin.index'))
-
-
 # -------------------- How to run --------------------
 # 1) pip install -U flask flask_sqlalchemy flask_migrate flask_cors flask-admin wtforms
 #    (Optionally: flask-httpauth for BasicAuth or flask-login/flask-security for richer auth.)
