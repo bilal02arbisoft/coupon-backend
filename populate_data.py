@@ -563,7 +563,17 @@ def populate_coupons():
         coupon.original_price = c.get("original_price")
         coupon.discounted_price = c.get("discounted_price")
         coupon.currency = c.get("currency")
-        coupon.expiry_date = c.get("expiry_date")  # keep as ISO string
+        # Parse ISO-like strings into datetime; ignore if unparsable
+        exp_raw = c.get("expiry_date")
+        exp_val = None
+        if isinstance(exp_raw, str):
+            for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                try:
+                    exp_val = datetime.strptime(exp_raw, fmt)
+                    break
+                except Exception:
+                    continue
+        coupon.expiry_date = exp_val
         coupon.terms_conditions = c.get("terms_conditions")
         coupon.usage_instructions = c.get("usage_instructions")
         coupon.minimum_order = c.get("minimum_order")

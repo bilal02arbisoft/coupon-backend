@@ -1,7 +1,8 @@
 from datetime import datetime
+import os
 import datetime as dt
 
-from flask import Flask, jsonify, redirect, url_for, request, flash, render_template_string
+from flask import Flask, jsonify, redirect, url_for, request, flash, render_template_string, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_cors import CORS
@@ -9,7 +10,9 @@ from flask_cors import CORS
 # --- NEW: Flask-Admin imports ---
 from flask_admin import Admin, AdminIndexView, expose
 from flask_admin.contrib.sqla import ModelView
+from flask_admin.form import ImageUploadField
 from wtforms import DateField
+from wtforms.fields.html5 import DateTimeLocalField
 
 # If you want simple HTTP Basic auth for /admin, uncomment these lines and the protected views below
 from flask_httpauth import HTTPBasicAuth
@@ -31,6 +34,13 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///coupons_stores.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'replace-this-in-prod'  # Needed by Flask‑Admin for forms/CSRF
+app.config['UPLOAD_FOLDER'] = os.path.join(app.instance_path, 'uploads')  # persisted locally alongside DB
+
+# Ensure upload directories exist (instance/uploads/{stores,categories})
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'stores'), exist_ok=True)
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'categories'), exist_ok=True)
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'banners'), exist_ok=True)
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'blogs'), exist_ok=True)
 
 # Allow all origins, methods, and headers
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
@@ -98,8 +108,8 @@ class Coupon(db.Model):
     original_price = db.Column(db.Float)
     discounted_price = db.Column(db.Float)
     currency = db.Column(db.String(20))
-    # NOTE: your schema stores expiry_date as a STRING. We'll keep DB as-is but make the admin form a real date.
-    expiry_date = db.Column(db.String(20))
+    # Expiry as true DateTime
+    expiry_date = db.Column(db.DateTime)
     terms_conditions = db.Column(db.String(255))
     usage_instructions = db.Column(db.String(255))
     minimum_order = db.Column(db.Float)
@@ -112,6 +122,9 @@ class Coupon(db.Model):
     deal_type = db.Column(db.String(50))
     applicable_products = db.Column(db.String(255))
     exclusions = db.Column(db.String(255))
+    # New flags
+    hot_deal = db.Column(db.Boolean, default=False, nullable=False)
+    show_on_homepage = db.Column(db.Boolean, default=False, nullable=False)
 
     # Many-to-many relationship with categories
     categories = db.relationship('Category', secondary=coupon_category, backref=db.backref('coupons', lazy='dynamic'))
@@ -128,6 +141,62 @@ class Category(db.Model):
 
     def __repr__(self):
         return f'<Category {self.name}>'
+
+# Simple banner model for homepage/sections with image and click-through URL
+class Banner(db.Model):
+    __tablename__ = 'banners'
+
+    id = db.Column(db.Integer, primary_key=True)
+    logo = db.Column(db.String(200))  # stored filename for uploaded banner image
+    url = db.Column(db.String(255))   # target URL when banner is clicked
+
+    def __repr__(self):
+        return f'<Banner {self.id}>'
+
+# About content model for company/about page
+class About(db.Model):
+    __tablename__ = 'about'
+
+    id = db.Column(db.Integer, primary_key=True)
+    company_name = db.Column(db.String(200))
+    legal_form = db.Column(db.String(200))
+    founded_year = db.Column(db.Integer)
+    our_story = db.Column(db.Text)  # long text
+    location = db.Column(db.Text)
+    phone = db.Column(db.String(50))
+    email = db.Column(db.String(120))
+    website = db.Column(db.String(200))
+    mission = db.Column(db.Text)
+    vision = db.Column(db.Text)
+    privacy_note = db.Column(db.Text)
+    disclaimer = db.Column(db.Text)
+    last_updated = db.Column(db.String(50))  # e.g., "October 2024"
+
+    def __repr__(self):
+        return f'<About {self.company_name or self.id}>'
+
+# Blog model for articles/news
+class Blog(db.Model):
+    __tablename__ = 'blogs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    slug = db.Column(db.String(255), unique=True, index=True, nullable=False)
+    image = db.Column(db.String(255))  # can be URL or uploaded filename under instance/uploads/blogs
+    description = db.Column(db.Text)
+    content = db.Column(db.Text)
+    date = db.Column(db.Date)
+    author = db.Column(db.String(120))
+    read_time = db.Column(db.String(50))
+    tags = db.Column(db.Text)  # comma-separated values
+
+    def __repr__(self):
+        return f'<Blog {self.slug}>'
+# Public route to serve uploaded images from instance/uploads
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
 
 
 login_manager = LoginManager(app)
@@ -206,11 +275,16 @@ def get_categories():
     categories = Category.query.all()
     categories_data = []
     for category in categories:
+        # Build icon URL if it's an uploaded file (stored as filename inside categories/)
+        icon_value = category.icon
+        if icon_value and not (str(icon_value).startswith('http://') or str(icon_value).startswith('https://') or str(icon_value).startswith('/')):
+            icon_value = url_for('uploaded_file', filename=f"categories/{icon_value}", _external=True)
+
         categories_data.append({
             "id": category.id,
             "name": category.name,
             "description": category.description,
-            "icon": category.icon
+            "icon": icon_value
         })
     return jsonify(categories_data)
 
@@ -220,10 +294,15 @@ def get_stores():
     stores = Store.query.all()
     stores_data = []
     for store in stores:
+        # Build logo URL if it's an uploaded file (stored as filename inside stores/)
+        logo_value = store.logo
+        if logo_value and not (str(logo_value).startswith('http://') or str(logo_value).startswith('https://') or str(logo_value).startswith('/')):
+            logo_value = url_for('uploaded_file', filename=f"stores/{logo_value}", _external=True)
+
         stores_data.append({
             "id": store.id,
             "name": store.name,
-            "logo": store.logo,
+            "logo": logo_value,
             "description": store.description,
             "website_url": store.website_url,
             "rating": store.rating,
@@ -253,13 +332,15 @@ def get_coupons():
             "original_price": coupon.original_price,
             "discounted_price": coupon.discounted_price,
             "currency": coupon.currency,
-            "expiry_date": coupon.expiry_date,
+            "expiry_date": coupon.expiry_date.isoformat() if coupon.expiry_date else None,
             "categories": [category.name for category in coupon.categories],
             "terms_conditions": coupon.terms_conditions,
             "usage_instructions": coupon.usage_instructions,
             "minimum_order": coupon.minimum_order,
             "maximum_discount": coupon.maximum_discount,
             "verified": coupon.verified,
+            "hot_deal": coupon.hot_deal,
+            "show_on_homepage": coupon.show_on_homepage,
             "success_rate": coupon.success_rate,
             "usage_count": coupon.usage_count,
             "user_rating": coupon.user_rating,
@@ -286,13 +367,15 @@ def get_coupons_by_store(store_id):
             "original_price": coupon.original_price,
             "discounted_price": coupon.discounted_price,
             "currency": coupon.currency,
-            "expiry_date": coupon.expiry_date,
+            "expiry_date": coupon.expiry_date.isoformat() if coupon.expiry_date else None,
             "categories": [category.name for category in coupon.categories],
             "terms_conditions": coupon.terms_conditions,
             "usage_instructions": coupon.usage_instructions,
             "minimum_order": coupon.minimum_order,
             "maximum_discount": coupon.maximum_discount,
             "verified": coupon.verified,
+            "hot_deal": coupon.hot_deal,
+            "show_on_homepage": coupon.show_on_homepage,
             "success_rate": coupon.success_rate,
             "usage_count": coupon.usage_count,
             "user_rating": coupon.user_rating,
@@ -323,13 +406,15 @@ def get_coupons_by_category(category_name):
             "original_price": coupon.original_price,
             "discounted_price": coupon.discounted_price,
             "currency": coupon.currency,
-            "expiry_date": coupon.expiry_date,
+            "expiry_date": coupon.expiry_date.isoformat() if coupon.expiry_date else None,
             "categories": [category.name for category in coupon.categories],
             "terms_conditions": coupon.terms_conditions,
             "usage_instructions": coupon.usage_instructions,
             "minimum_order": coupon.minimum_order,
             "maximum_discount": coupon.maximum_discount,
             "verified": coupon.verified,
+            "hot_deal": coupon.hot_deal,
+            "show_on_homepage": coupon.show_on_homepage,
             "success_rate": coupon.success_rate,
             "usage_count": coupon.usage_count,
             "user_rating": coupon.user_rating,
@@ -343,17 +428,8 @@ def get_coupons_by_category(category_name):
 
 @app.route('/api/coupons/expiring', methods=['GET'])
 def get_expiring_coupons():
-    cutoff_date = datetime.utcnow() + dt.timedelta(days=7)  # Coupons expiring in the next 7 days
-    # Since expiry_date is a string, attempt to parse as ISO date first; fallback to include none.
-    coupons = []
-    for c in Coupon.query.all():
-        try:
-            exp = datetime.fromisoformat(c.expiry_date)
-            if exp <= cutoff_date:
-                coupons.append(c)
-        except Exception:
-            # Skip unparsable dates
-            continue
+    cutoff_date = datetime.utcnow() + dt.timedelta(days=7)
+    coupons = Coupon.query.filter(Coupon.expiry_date.isnot(None), Coupon.expiry_date <= cutoff_date).all()
 
     coupons_data = []
     for coupon in coupons:
@@ -367,13 +443,15 @@ def get_expiring_coupons():
             "original_price": coupon.original_price,
             "discounted_price": coupon.discounted_price,
             "currency": coupon.currency,
-            "expiry_date": coupon.expiry_date,
+            "expiry_date": coupon.expiry_date.isoformat() if coupon.expiry_date else None,
             "categories": [category.name for category in coupon.categories],
             "terms_conditions": coupon.terms_conditions,
             "usage_instructions": coupon.usage_instructions,
             "minimum_order": coupon.minimum_order,
             "maximum_discount": coupon.maximum_discount,
             "verified": coupon.verified,
+            "hot_deal": coupon.hot_deal,
+            "show_on_homepage": coupon.show_on_homepage,
             "success_rate": coupon.success_rate,
             "usage_count": coupon.usage_count,
             "user_rating": coupon.user_rating,
@@ -395,6 +473,143 @@ def get_total_stores_count():
 def get_total_coupons_count():
     total_coupons = Coupon.query.count()
     return jsonify({"total_coupons": total_coupons})
+
+
+@app.route('/api/coupons/hot', methods=['GET'])
+def get_hot_coupons():
+    coupons = Coupon.query.filter_by(hot_deal=True).all()
+    data = []
+    for coupon in coupons:
+        data.append({
+            "id": coupon.id,
+            "title": coupon.title,
+            "store_id": coupon.store_id,
+            "code": coupon.code,
+            "discount_type": coupon.discount_type,
+            "discount_value": coupon.discount_value,
+            "original_price": coupon.original_price,
+            "discounted_price": coupon.discounted_price,
+            "currency": coupon.currency,
+            "expiry_date": coupon.expiry_date.isoformat() if coupon.expiry_date else None,
+            "categories": [category.name for category in coupon.categories],
+            "terms_conditions": coupon.terms_conditions,
+            "usage_instructions": coupon.usage_instructions,
+            "minimum_order": coupon.minimum_order,
+            "maximum_discount": coupon.maximum_discount,
+            "verified": coupon.verified,
+            "hot_deal": coupon.hot_deal,
+            "show_on_homepage": coupon.show_on_homepage,
+            "success_rate": coupon.success_rate,
+            "usage_count": coupon.usage_count,
+            "user_rating": coupon.user_rating,
+            "featured": coupon.featured,
+            "deal_type": coupon.deal_type,
+            "applicable_products": coupon.applicable_products,
+            "exclusions": coupon.exclusions
+        })
+    return jsonify(data)
+
+
+@app.route('/api/coupons/homepage', methods=['GET'])
+def get_homepage_coupons():
+    coupons = Coupon.query.filter_by(show_on_homepage=True).all()
+    data = []
+    for coupon in coupons:
+        data.append({
+            "id": coupon.id,
+            "title": coupon.title,
+            "store_id": coupon.store_id,
+            "code": coupon.code,
+            "discount_type": coupon.discount_type,
+            "discount_value": coupon.discount_value,
+            "original_price": coupon.original_price,
+            "discounted_price": coupon.discounted_price,
+            "currency": coupon.currency,
+            "expiry_date": coupon.expiry_date,
+            "categories": [category.name for category in coupon.categories],
+            "terms_conditions": coupon.terms_conditions,
+            "usage_instructions": coupon.usage_instructions,
+            "minimum_order": coupon.minimum_order,
+            "maximum_discount": coupon.maximum_discount,
+            "verified": coupon.verified,
+            "hot_deal": coupon.hot_deal,
+            "show_on_homepage": coupon.show_on_homepage,
+            "success_rate": coupon.success_rate,
+            "usage_count": coupon.usage_count,
+            "user_rating": coupon.user_rating,
+            "featured": coupon.featured,
+            "deal_type": coupon.deal_type,
+            "applicable_products": coupon.applicable_products,
+            "exclusions": coupon.exclusions
+        })
+    return jsonify(data)
+
+# Single about document fetch
+@app.route('/api/about', methods=['GET'])
+def get_about():
+    # Fetch first (or only) about entry
+    about = About.query.order_by(About.id.asc()).first()
+    if not about:
+        return jsonify({}), 200
+    return jsonify({
+        "company_name": about.company_name,
+        "legal_form": about.legal_form,
+        "founded_year": about.founded_year,
+        "our_story": about.our_story,
+        "location": about.location,
+        "phone": about.phone,
+        "email": about.email,
+        "website": about.website,
+        "mission": about.mission,
+        "vision": about.vision,
+        "privacy_note": about.privacy_note,
+        "disclaimer": about.disclaimer,
+        "last_updated": about.last_updated,
+    })
+
+
+# List banners with absolute image URLs
+@app.route('/api/banners', methods=['GET'])
+def get_banners():
+    banners = Banner.query.all()
+    data = []
+    for b in banners:
+        logo_value = b.logo
+        if logo_value and not (str(logo_value).startswith('http://') or str(logo_value).startswith('https://') or str(logo_value).startswith('/')):
+            logo_value = url_for('uploaded_file', filename=f"banners/{logo_value}", _external=True)
+        data.append({
+            "id": b.id,
+            "logo": logo_value,
+            "url": b.url,
+        })
+    return jsonify(data)
+
+
+# List blogs
+@app.route('/api/blogs', methods=['GET'])
+def get_blogs():
+    blogs = Blog.query.order_by(Blog.date.desc().nullslast()).all()
+    data = []
+    for b in blogs:
+        image_value = b.image
+        if image_value and not (str(image_value).startswith('http://') or str(image_value).startswith('https://') or str(image_value).startswith('/')):
+            image_value = url_for('uploaded_file', filename=f"blogs/{image_value}", _external=True)
+        tags_list = []
+        if b.tags:
+            tags_list = [t.strip() for t in str(b.tags).split(',') if t.strip()]
+        data.append({
+            "id": b.id,
+            "title": b.title,
+            "slug": b.slug,
+            "image": image_value,
+            "description": b.description,
+            "content": b.content,
+            "date": b.date.isoformat() if b.date else None,
+            "author": b.author,
+            "readTime": b.read_time,
+            "tags": tags_list,
+        })
+    return jsonify(data)
 
 
 # -------------------- ADMIN PANEL --------------------
@@ -426,53 +641,92 @@ class StoreAdmin(SecureModelView):
         'established_year', 'headquarters', 'return_policy', 'shipping_info', 'categories'
     ]
 
+    # Save uploaded logos to instance/uploads/stores and store filename in DB
+    form_extra_fields = {
+        'logo': ImageUploadField('Logo',
+                                 base_path=os.path.join(app.config['UPLOAD_FOLDER'], 'stores'),
+                                 allow_overwrite=False)
+    }
+
 
 class CategoryAdmin(SecureModelView):
     column_list = ['id', 'name', 'description', 'icon']
     column_searchable_list = ['id', 'name', 'description']
     form_columns = ['id', 'name', 'description', 'icon']
 
+    # Save uploaded icons to instance/uploads/categories and store filename in DB
+    form_extra_fields = {
+        'icon': ImageUploadField('Icon',
+                                 base_path=os.path.join(app.config['UPLOAD_FOLDER'], 'categories'),
+                                 allow_overwrite=False)
+    }
+
+
+class BannerAdmin(SecureModelView):
+    column_list = ['id', 'logo', 'url']
+    column_searchable_list = ['url']
+    form_columns = ['logo', 'url']
+
+    # Save uploaded banner images to instance/uploads/banners and store filename in DB
+    form_extra_fields = {
+        'logo': ImageUploadField('Banner Image',
+                                 base_path=os.path.join(app.config['UPLOAD_FOLDER'], 'banners'),
+                                 allow_overwrite=False)
+    }
+
 
 class CouponAdmin(SecureModelView):
     column_list = [
         'id', 'title', 'store_id', 'code', 'discount_type', 'discount_value', 'currency',
-        'expiry_date', 'verified', 'featured', 'deal_type', 'success_rate', 'usage_count', 'user_rating', 'categories'
+        'expiry_date', 'verified', 'featured', 'hot_deal', 'show_on_homepage', 'deal_type', 'success_rate', 'usage_count', 'user_rating', 'categories'
     ]
     column_searchable_list = ['id', 'title', 'code', 'deal_type', 'terms_conditions', 'usage_instructions']
     column_filters = [
-        'store_id', 'discount_type', 'currency', 'verified', 'featured', 'deal_type', 'categories'
+        'store_id', 'discount_type', 'currency', 'verified', 'featured', 'hot_deal', 'show_on_homepage', 'deal_type', 'categories'
     ]
 
     form_columns = [
         'id', 'title', 'store_id', 'code', 'discount_type', 'discount_value', 'original_price', 'discounted_price',
         'currency', 'expiry_date', 'terms_conditions', 'usage_instructions', 'minimum_order', 'maximum_discount',
-        'verified', 'success_rate', 'usage_count', 'user_rating', 'featured', 'deal_type', 'applicable_products',
+        'verified', 'hot_deal', 'show_on_homepage', 'success_rate', 'usage_count', 'user_rating', 'featured', 'deal_type', 'applicable_products',
         'exclusions', 'categories'
     ]
 
-    # Present expiry_date as a real date picker but store as ISO string to keep your DB schema unchanged
+    # Present expiry_date as HTML5 datetime-local
     def scaffold_form(self):
         form_class = super().scaffold_form()
-        # Replace default StringField with DateField (HTML5 date picker)
-        form_class.expiry_date = DateField('Expiry Date', format='%Y-%m-%d', description='YYYY-MM-DD', default=None)
+        # HTML5 datetime-local (no timezone); store naive datetime in DB
+        form_class.expiry_date = DateTimeLocalField('Expiry Date/Time', format='%Y-%m-%dT%H:%M', default=None)
         return form_class
 
     def on_form_prefill(self, form, id):
-        # When editing, WTForms DateField expects a date object; your DB stores a string.
         model = self.get_one(id)
-        if model and isinstance(model.expiry_date, str) and model.expiry_date:
-            try:
-                form.expiry_date.data = datetime.strptime(model.expiry_date, '%Y-%m-%d').date()
-            except Exception:
-                form.expiry_date.data = None
+        if model:
+            form.expiry_date.data = model.expiry_date
         return super().on_form_prefill(form, id)
 
     def on_model_change(self, form, model, is_created):
-        # Convert the DateField value back into ISO string in the DB model
-        if hasattr(form, 'expiry_date') and form.expiry_date.data:
-            model.expiry_date = form.expiry_date.data.strftime('%Y-%m-%d')
-        else:
-            model.expiry_date = None
+        if hasattr(form, 'expiry_date'):
+            model.expiry_date = form.expiry_date.data or None
+        return super().on_model_change(form, model, is_created)
+
+# Admin for Blog model
+class BlogAdmin(SecureModelView):
+    column_list = ['id', 'title', 'slug', 'date', 'author', 'read_time']
+    column_searchable_list = ['title', 'slug', 'author', 'description', 'content']
+    column_filters = ['date', 'author']
+    form_columns = ['title', 'slug', 'image', 'description', 'content', 'date', 'author', 'read_time', 'tags']
+
+    form_extra_fields = {
+        'image': ImageUploadField('Image',
+                                  base_path=os.path.join(app.config['UPLOAD_FOLDER'], 'blogs'),
+                                  allow_overwrite=False)
+    }
+
+    def on_model_change(self, form, model, is_created):
+        # ensure slug populated from title if missing
+        if not model.slug and model.title:
+            model.slug = "-".join(model.title.lower().split())
         return super().on_model_change(form, model, is_created)
 
 # --- NEW: Manage Users inside Admin ---
@@ -522,6 +776,15 @@ admin = Admin(app, name='Coupons Admin', template_mode='bootstrap4', index_view=
 admin.add_view(StoreAdmin(Store, db.session, category='Models'))
 admin.add_view(CouponAdmin(Coupon, db.session, category='Models'))
 admin.add_view(CategoryAdmin(Category, db.session, category='Models'))
+admin.add_view(BannerAdmin(Banner, db.session, category='Content'))
+admin.add_view(BlogAdmin(Blog, db.session, category='Content'))
+class AboutAdmin(SecureModelView):
+    can_create = True
+    can_delete = True
+    column_list = ['company_name', 'legal_form', 'founded_year', 'phone', 'email', 'website', 'last_updated']
+    form_columns = ['company_name', 'legal_form', 'founded_year', 'our_story', 'location', 'phone', 'email', 'website', 'mission', 'vision', 'privacy_note', 'disclaimer', 'last_updated']
+
+admin.add_view(AboutAdmin(About, db.session, category='Content'))
 admin.add_view(UserAdmin(User, db.session, category='Security'))  # <- NEW
 
 # --- Minimal Jinja template for the admin dashboard quick stats ---
