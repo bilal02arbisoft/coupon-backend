@@ -31,7 +31,13 @@ def verify_password(username, password):
     return None
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql+psycopg2://myapp:REPLACE_ME_STRONG@/myappdb?host=/var/run/postgresql'
+db_url = (
+    os.getenv("SQLALCHEMY_DATABASE_URI")
+    or os.getenv("DATABASE_URL")
+    or "postgresql+psycopg2://myapp:REPLACE_ME_STRONG@127.0.0.1:5432/myappdb"
+)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'replace-this-in-prod'  # Needed by Flask‑Admin for forms/CSRF
 app.config['UPLOAD_FOLDER'] = os.path.join(app.instance_path, 'uploads')  # persisted locally alongside DB
