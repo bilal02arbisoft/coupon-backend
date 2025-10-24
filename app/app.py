@@ -31,7 +31,7 @@ def verify_password(username, password):
     return None
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///coupons_stores.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql+psycopg2://myapp:REPLACE_ME_STRONG@/myappdb?host=/var/run/postgresql'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'replace-this-in-prod'  # Needed by Flask‑Admin for forms/CSRF
 app.config['UPLOAD_FOLDER'] = os.path.join(app.instance_path, 'uploads')  # persisted locally alongside DB
